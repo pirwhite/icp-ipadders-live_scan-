@@ -1,0 +1,1983 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+安全工具：URL威胁情报与备案扫描系统（Windows兼容版）
+作者：p1r07
+版本：7.3.0（移除tty/termios+删除URL有效性判断）
+特性：Windows完全兼容、右侧打印输出、阿里云API备案查询
+"""
+
+import os
+import sys
+import pkg_resources
+import configparser
+import json
+import time
+import hmac
+import hashlib
+import base64
+import csv
+import asyncio
+import aiohttp
+import random
+import re
+import socket
+from urllib.parse import urlparse, urlunparse, quote_plus, urlencode
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
+from colorama import init, Fore, Style
+import logging
+from datetime import datetime
+import tldextract
+
+# Windows兼容性处理（移除Linux/macOS专属依赖）
+if sys.platform.startswith('win'):
+    import ctypes
+    import msvcrt
+    # 启用Windows终端VT100颜色支持
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception as e:
+        print(f"{Fore.YELLOW}Windows终端颜色支持启用失败: {str(e)}{Style.RESET_ALL}")
+
+# -------------------------- 全局常量定义 --------------------------
+# 火焰主题配置
+FIRE_COLORS = {
+    "red": Fore.RED,
+    "dark_red": Fore.LIGHTRED_EX,
+    "orange": Fore.LIGHTYELLOW_EX,
+    "yellow": Fore.YELLOW,
+    "gold": Fore.LIGHTGREEN_EX,
+    "blue": Fore.BLUE,
+    "purple": Fore.MAGENTA,
+    "reset": Style.RESET_ALL
+}
+
+FIRE_ICONS = {
+    "flame": f"{FIRE_COLORS['red']}🔥{FIRE_COLORS['reset']}",
+    "success": f"{FIRE_COLORS['yellow']}✅{FIRE_COLORS['reset']}",
+    "error": f"{FIRE_COLORS['red']}❌{FIRE_COLORS['reset']}",
+    "info": f"{FIRE_COLORS['blue']}ℹ️{FIRE_COLORS['reset']}",
+    "warning": f"{FIRE_COLORS['orange']}⚠️{FIRE_COLORS['reset']}",
+    "check": f"{FIRE_COLORS['yellow']}🔍{FIRE_COLORS['reset']}",
+    "icp": f"{FIRE_COLORS['blue']}📋{FIRE_COLORS['reset']}",
+    "ip": f"{FIRE_COLORS['gold']}🌐{FIRE_COLORS['reset']}",
+    "threat": f"{FIRE_COLORS['red']}⚠️{FIRE_COLORS['reset']}",
+    "menu": f"{FIRE_COLORS['blue']}📋{FIRE_COLORS['reset']}"
+}
+
+FIRE_SEPARATOR = f"{FIRE_COLORS['red']}-{FIRE_COLORS['orange']}-{FIRE_COLORS['yellow']}-" * 10
+
+# 工具基础信息
+TOOL_NAME = "URL威胁情报扫描系统（Windows兼容版）"
+AUTHOR = "p1r07"
+VERSION = "7.3.0"
+MODIFY_TIME = "2024/06/02 10:30"
+
+# 路径配置（工具同目录）
+当前目录 = os.path.dirname(os.path.abspath(__file__))
+CSV_OUTPUT_DIR = os.path.join(当前目录, "scan_results")
+HISTORY_DIR = os.path.join(当前目录, "scan_history")
+CACHE_DIR = os.path.join(当前目录, "cache")
+for dir_path in [CSV_OUTPUT_DIR, HISTORY_DIR, CACHE_DIR]:
+    os.makedirs(dir_path, exist_ok=True)
+
+# -------------------------- 依赖检查 --------------------------
+def 检查依赖():
+    """检查并确保所有依赖包已安装"""
+    required_packages = [
+        'colorama>=0.4.6',
+        'pycryptodome>=3.18.0',
+        'tldextract>=3.4.0',
+        'aiohttp>=3.8.4'
+    ]
+    
+    missing_packages = []
+    for package in required_packages:
+        try:
+            pkg_resources.require(package)
+        except Exception as e:
+            missing_packages.append(package.split('>=')[0])
+    
+    if missing_packages:
+        print(f"{Fore.RED}【依赖缺失】需安装: {', '.join(missing_packages)}{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}安装命令: pip install {' '.join(missing_packages)}{Style.RESET_ALL}")
+        sys.exit(1)
+
+# 预先执行依赖检查
+检查依赖()
+
+# -------------------------- 右侧打印管理器（Windows兼容） --------------------------
+class 右侧打印管理器:
+    """控制Python解释器内右侧输出，左侧保留命令交互（Windows兼容）"""
+    def __init__(self, split_ratio=0.4):
+        """
+        Args:
+            split_ratio: 左侧交互区占比（0.3~0.5为宜）
+        """
+        self.split_ratio = split_ratio
+        self.terminal_width = self._get_terminal_width()
+        self.left_width = int(self.terminal_width * split_ratio)
+        self.right_width = self.terminal_width - self.left_width - 1  # 减1避免换行
+        self.right_buffer = []
+        
+        # 初始化日志重定向（将logging输出到右侧）
+        self._init_logging_redirect()
+        
+    def _get_terminal_width(self):
+        """获取终端宽度（Windows专用实现）"""
+        try:
+            if sys.platform.startswith('win'):
+                # Windows终端宽度获取
+                h = ctypes.windll.kernel32.GetStdHandle(-12)
+                csbi = ctypes.create_string_buffer(22)
+                ctypes.windll.kernel32.GetConsoleScreenBufferInfo(h, csbi)
+                return ctypes.c_int32.from_buffer(csbi, 18).value
+            else:
+                # 非Windows默认宽度
+                return 120
+        except:
+            return 120  # 默认宽度
+    
+   
+    def _init_logging_redirect(self):
+        """重定向logging输出到右侧区域"""
+        class 右侧日志处理器(logging.Handler):
+            def __init__(self, parent):
+                super().__init__()
+                self.parent = parent
+            
+            def emit(self, record):
+                msg = self.format(record)
+                self.parent.print_to_right(msg)
+        
+        # 配置日志格式
+        logger = logging.getLogger()
+        logger.setLevel(logging.INFO)
+        logger.handlers = []  # 清空默认处理器
+        
+        # 添加右侧日志处理器
+        right_handler = 右侧日志处理器(self)
+        formatter = logging.Formatter(
+            f"{FIRE_COLORS['orange']}[%(asctime)s]{FIRE_COLORS['reset']} %(message)s",
+            datefmt="%H:%M:%S"
+        )
+        right_handler.setFormatter(formatter)
+        logger.addHandler(right_handler)
+    
+    def clear_right(self):
+        """清空右侧区域"""
+        # ANSI转义序列：移动到右侧起始位置 + 清空行 + 向下清空
+        clear_cmd = f"\033[{self.left_width+1}G\033[K"
+        for _ in range(20):  # 清空20行（可根据需求调整）
+            print(clear_cmd, end='', flush=True)
+            print("\033[1B", end='', flush=True)  # 下移一行
+        # 回到右侧顶部
+        print(f"\033[{20}A\033[{self.left_width+1}G", end='', flush=True)
+    
+    def print_to_right(self, msg):
+        """打印内容到右侧区域"""
+        # 确保消息不超过右侧宽度
+        if len(msg) > self.right_width:
+            # 分割长消息（按右侧宽度换行）
+            for i in range(0, len(msg), self.right_width):
+                sub_msg = msg[i:i+self.right_width]
+                self._print_single_line(sub_msg)
+        else:
+            self._print_single_line(msg)
+    
+    def _print_single_line(self, line):
+        """打印单行到右侧"""
+        # ANSI转义序列：移动到右侧起始列 + 打印内容 + 清空当前行剩余部分
+        print(f"\033[{self.left_width+1}G{line}\033[K", end='\n', flush=True)
+        # 回到左侧当前行（确保命令输入不受影响）
+        print(f"\033[{self.left_width+1}G\033[{len(line)}D\033[{self.left_width}D", end='', flush=True)
+    
+    def reset_terminal(self):
+        """重置终端布局（程序退出时调用）"""
+        print("\033[0m\033[H\033[J", end='', flush=True)  # 重置颜色 + 清空屏幕
+    
+    def 等待用户按键(self):
+        """Windows兼容的等待按键（移除tty依赖）"""
+        print(f"\n{FIRE_ICONS['info']} 按任意键继续...", end='', flush=True)
+        if sys.platform.startswith('win'):
+            msvcrt.getch()  # Windows按键获取
+        else:
+            input()  # 非Windows兼容方式
+        print("\r" + " " * 30 + "\r", end='', flush=True)
+
+# -------------------------- 配置管理（含阿里云双密钥） --------------------------
+class 配置管理器:
+    """配置管理（支持阿里云AccessKeyId/AccessKeySecret、API密钥、系统设置）"""
+    def __init__(self):
+        # 配置文件路径（跨平台）
+        if sys.platform.startswith('win'):
+            self.config_dir = os.path.join(os.environ['APPDATA'], 'url_scanner')
+        else:
+            self.config_dir = os.path.expanduser('~/.url_scanner')
+        os.makedirs(self.config_dir, exist_ok=True)
+        self.config_path = os.path.join(self.config_dir, 'config.ini')
+        self.config = configparser.ConfigParser()
+        
+        # 加载或初始化配置
+        if os.path.exists(self.config_path):
+            self.config.read(self.config_path, encoding='utf-8')
+        else:
+            self._init_default_config()
+    
+    def _init_default_config(self):
+        """初始化默认配置"""
+        # 阿里云备案API（按官方文档需双密钥）
+        self.config['ALIYUN_BEI_AN'] = {
+            'AccessKeyId': '',
+            'AccessKeySecret': '',
+            'RegionId': 'cn-hangzhou',  # 官方默认Region
+            'ApiVersion': '2018-06-08'   # 官方最新版本
+        }
+        
+        # 威胁情报API
+        self.config['THREAT_API'] = {
+            'virustotal_key': '',
+            'weibu_key': ''
+        }
+        
+        # 系统设置
+        self.config['SYSTEM'] = {
+            'default_workers': '3',
+            'timeout': '15',
+            'print_delay': '0.05',
+            'show_banner': 'True',
+            'auto_save_csv': 'True'
+        }
+        
+        # 保存默认配置
+        self.save_config()
+    
+    def save_config(self):
+        """保存配置到文件"""
+        try:
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                self.config.write(f)
+            return True
+        except Exception as e:
+            logging.error(f"{FIRE_ICONS['error']} 保存配置失败: {str(e)}")
+            return False
+    
+    # -------------------------- 阿里云备案API配置 --------------------------
+    def get_aliyun_config(self):
+        """获取阿里云备案API配置（含双密钥）"""
+        if 'ALIYUN_BEI_AN' not in self.config:
+            self.config['ALIYUN_BEI_AN'] = {'AccessKeyId': '', 'AccessKeySecret': '', 'RegionId': 'cn-hangzhou'}
+        return {
+            'AccessKeyId': self.config['ALIYUN_BEI_AN'].get('AccessKeyId', ''),
+            'AccessKeySecret': self.config['ALIYUN_BEI_AN'].get('AccessKeySecret', ''),
+            'RegionId': self.config['ALIYUN_BEI_AN'].get('RegionId', 'cn-hangzhou'),
+            'ApiVersion': self.config['ALIYUN_BEI_AN'].get('ApiVersion', '2018-06-08')
+        }
+    
+    def set_aliyun_config(self, access_key_id, access_key_secret, region_id='cn-hangzhou'):
+        """设置阿里云备案API配置"""
+        if 'ALIYUN_BEI_AN' not in self.config:
+            self.config['ALIYUN_BEI_AN'] = {}
+        self.config['ALIYUN_BEI_AN']['AccessKeyId'] = access_key_id
+        self.config['ALIYUN_BEI_AN']['AccessKeySecret'] = access_key_secret
+        self.config['ALIYUN_BEI_AN']['RegionId'] = region_id
+        return self.save_config()
+    
+    # -------------------------- 威胁情报API配置 --------------------------
+    def get_threat_api_key(self, api_name):
+        """获取威胁情报API密钥（virustotal/weibu）"""
+        if 'THREAT_API' not in self.config:
+            return ''
+        return self.config['THREAT_API'].get(f'{api_name}_key', '')
+    
+    def set_threat_api_key(self, api_name, api_key):
+        """设置威胁情报API密钥"""
+        if 'THREAT_API' not in self.config:
+            self.config['THREAT_API'] = {}
+        self.config['THREAT_API'][f'{api_name}_key'] = api_key
+        return self.save_config()
+    
+    # -------------------------- 系统设置 --------------------------
+    def get_system_setting(self, key, default=''):
+        """获取系统设置"""
+        if 'SYSTEM' not in self.config:
+            return default
+        return self.config['SYSTEM'].get(key, default)
+    
+    def set_system_setting(self, key, value):
+        """设置系统设置"""
+        if 'SYSTEM' not in self.config:
+            self.config['SYSTEM'] = {}
+        self.config['SYSTEM'][key] = str(value)
+        return self.save_config()
+    
+    def 显示配置信息(self):
+        """显示当前配置信息"""
+        print(f"\n{FIRE_SEPARATOR}")
+        print(f"{FIRE_ICONS['info']} {FIRE_COLORS['blue']}当前配置信息{FIRE_COLORS['reset']}")
+        print(f"{FIRE_SEPARATOR}\n")
+        
+        # 阿里云配置
+        aliyun_cfg = self.get_aliyun_config()
+        print(f"{FIRE_COLORS['yellow']}阿里云备案API配置:{FIRE_COLORS['reset']}")
+        print(f"  AccessKeyId: {'已配置' if aliyun_cfg['AccessKeyId'] else '未配置'}")
+        print(f"  AccessKeySecret: {'已配置' if aliyun_cfg['AccessKeySecret'] else '未配置'}")
+        print(f"  RegionId: {aliyun_cfg['RegionId']}")
+        print(f"  ApiVersion: {aliyun_cfg['ApiVersion']}\n")
+        
+        # 威胁情报配置
+        print(f"{FIRE_COLORS['yellow']}威胁情报API配置:{FIRE_COLORS['reset']}")
+        print(f"  VirusTotal: {'已配置' if self.get_threat_api_key('virustotal') else '未配置'}")
+        print(f"  微步情报: {'已配置' if self.get_threat_api_key('weibu') else '未配置'}\n")
+        
+        # 系统设置
+        print(f"{FIRE_COLORS['yellow']}系统设置:{FIRE_COLORS['reset']}")
+        print(f"  默认工作线程数: {self.get_system_setting('default_workers', '3')}")
+        print(f"  超时时间(秒): {self.get_system_setting('timeout', '15')}")
+        print(f"  打印延迟(秒): {self.get_system_setting('print_delay', '0.05')}")
+        print(f"  显示Banner: {'是' if self.get_system_setting('show_banner') == 'True' else '否'}")
+        print(f"  自动保存CSV: {'是' if self.get_system_setting('auto_save_csv') == 'True' else '否'}\n")
+
+# -------------------------- 阿里云API签名工具（按官方文档实现） --------------------------
+class 阿里云签名工具:
+    """阿里云API签名生成器（遵循官方HMAC-SHA1签名规范）"""
+    @staticmethod
+    def generate_signature(params, access_key_secret):
+        """
+        生成阿里云API签名
+        参考文档：https://developer.aliyun.com/article/1670298#section-4
+        """
+        # 1. 按参数名ASCII排序
+        sorted_params = sorted(params.items(), key=lambda x: x[0])
+        
+        # 2. 拼接参数为URL编码格式（需编码特殊字符）
+        query_string = ''
+        for key, value in sorted_params:
+            query_string += f"&{quote_plus(str(key))}={quote_plus(str(value))}"
+        
+        # 3. 拼接签名原串（去除第一个&）
+        sign_string = f"GET&%2F&{quote_plus(query_string[1:])}"
+        
+        # 4. HMAC-SHA1签名 + Base64编码
+        hmac_obj = hmac.new(
+            f"{access_key_secret}&".encode('utf-8'),  # 密钥需加&后缀
+            sign_string.encode('utf-8'),
+            hashlib.sha1
+        )
+        signature = base64.b64encode(hmac_obj.digest()).decode('utf-8')
+        return signature
+    
+    @staticmethod
+    def build_request_url(params, access_key_secret, domain='beian.aliyuncs.com'):
+        """构建完整的阿里云API请求URL（含签名）"""
+        # 1. 添加公共参数（官方必传）
+        public_params = {
+            'Format': 'JSON',
+            'Version': params.pop('ApiVersion', '2018-06-08'),
+            'AccessKeyId': params.pop('AccessKeyId'),
+            'SignatureMethod': 'HMAC-SHA1',
+            'Timestamp': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'SignatureVersion': '1.0',
+            'SignatureNonce': str(random.randint(100000, 999999))  # 随机数防重放
+        }
+        
+        # 2. 合并公共参数与业务参数
+        all_params = {**public_params, **params}
+        
+        # 3. 生成签名
+        signature = 阿里云签名工具.generate_signature(all_params, access_key_secret)
+        all_params['Signature'] = signature
+        
+        # 4. 构建URL
+        query_string = urlencode(all_params)
+        return f"https://{domain}?{query_string}"
+
+# -------------------------- 历史数据管理 --------------------------
+class 历史数据管理器:
+    """历史扫描记录管理（保存/查询/删除）"""
+    def __init__(self):
+        self.history_dir = HISTORY_DIR
+    
+    def save_history(self, results, scan_type='single', target='url'):
+        """保存扫描结果到历史"""
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        history_id = f"scan_{timestamp}"
+        history_path = os.path.join(self.history_dir, f"{history_id}.json")
+        
+        try:
+            with open(history_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'history_id': history_id,
+                    'timestamp': timestamp,
+                    'scan_type': scan_type,
+                    'target': target,
+                    'result_count': len(results),
+                    'results': results
+                }, f, ensure_ascii=False, indent=2)
+            
+            # 更新索引
+            self._update_index(history_id, timestamp, scan_type, target, len(results))
+            logging.info(f"{FIRE_ICONS['flame']} 历史记录保存成功（ID: {history_id}）")
+            return history_id
+        except Exception as e:
+            logging.error(f"{FIRE_ICONS['error']} 保存历史记录失败: {str(e)}")
+            return None
+    
+    def _update_index(self, history_id, timestamp, scan_type, target, count):
+        """更新历史索引"""
+        index_path = os.path.join(self.history_dir, 'history_index.json')
+        index = []
+        
+        # 加载现有索引
+        if os.path.exists(index_path):
+            with open(index_path, 'r', encoding='utf-8') as f:
+                index = json.load(f)
+        
+        # 添加新记录（最新在前）
+        index.insert(0, {
+            'history_id': history_id,
+            'timestamp': timestamp,
+            'scan_type': scan_type,
+            'target': target[:20] + '...' if len(target) > 20 else target,
+            'result_count': count
+        })
+        
+        # 限制索引数量（最多100条）
+        if len(index) > 100:
+            index = index[:100]
+        
+        # 保存索引
+        with open(index_path, 'w', encoding='utf-8') as f:
+            json.dump(index, f, ensure_ascii=False, indent=2)
+    
+    def get_history_list(self, limit=10):
+        """获取历史记录列表"""
+        index_path = os.path.join(self.history_dir, 'history_index.json')
+        if not os.path.exists(index_path):
+            return []
+        
+        with open(index_path, 'r', encoding='utf-8') as f:
+            index = json.load(f)
+        return index[:limit]
+    
+    def get_history_detail(self, history_id):
+        """获取历史记录详情"""
+        history_path = os.path.join(self.history_dir, f"{history_id}.json")
+        if not os.path.exists(history_path):
+            logging.warning(f"{FIRE_ICONS['warning']} 历史记录不存在（ID: {history_id}）")
+            return None
+        
+        try:
+            with open(history_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"{FIRE_ICONS['error']} 读取历史记录失败: {str(e)}")
+            return None
+    
+    def 显示历史列表(self):
+        """显示历史记录列表"""
+        history_list = self.get_history_list()
+        
+        if not history_list:
+            print(f"\n{FIRE_ICONS['info']} 没有历史扫描记录")
+            return False
+            
+        print(f"\n{FIRE_SEPARATOR}")
+        print(f"{FIRE_ICONS['flame']} {FIRE_COLORS['purple']}历史扫描记录{FIRE_COLORS['reset']}")
+        print(f"{FIRE_SEPARATOR}\n")
+        
+        print(f"  {FIRE_COLORS['yellow']}编号 | 扫描时间 | 扫描类型 | 目标 | 结果数量{FIRE_COLORS['reset']}")
+        print(f"  {FIRE_COLORS['orange']}{'-'*70}{FIRE_COLORS['reset']}")
+        
+        for i, record in enumerate(history_list, 1):
+            # 格式化时间
+            try:
+                dt = datetime.strptime(record['timestamp'], '%Y%m%d_%H%M%S')
+                formatted_time = dt.strftime('%Y-%m-%d %H:%M')
+            except:
+                formatted_time = record['timestamp']
+                
+            # 显示信息
+            print(f"  {i:2d}   {formatted_time}  {record['scan_type']:8s}  {record['target']:20s}  {record['result_count']}")
+        
+        print(f"\n{FIRE_ICONS['info']} 输入编号查看详情，0返回主菜单")
+        return True
+
+# -------------------------- 缓存管理 --------------------------
+class 缓存管理器:
+    """缓存管理（ICP/IP/威胁情报）"""
+    def __init__(self):
+        self.cache_dir = CACHE_DIR
+        self.cache_expire = {
+            'icp': 86400,    # 1天
+            'ip': 3600,      # 1小时
+            'threat': 3600   # 1小时
+        }
+    
+    def get_cache(self, cache_type, key):
+        """获取缓存（带过期检查）"""
+        cache_path = os.path.join(self.cache_dir, f"{cache_type}_cache.json")
+        if not os.path.exists(cache_path):
+            return None
+        
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                cache = json.load(f)
+            
+            # 检查缓存是否存在且未过期
+            if key in cache:
+                data = cache[key]
+                if time.time() - data['timestamp'] < self.cache_expire[cache_type]:
+                    return data['value']
+                else:
+                    # 过期缓存清理
+                    del cache[key]
+                    self._save_cache(cache_type, cache)
+            return None
+        except Exception as e:
+            logging.warning(f"{FIRE_ICONS['warning']} 读取{cache_type}缓存失败: {str(e)}")
+            return None
+    
+    def set_cache(self, cache_type, key, value):
+        """设置缓存"""
+        cache_path = os.path.join(self.cache_dir, f"{cache_type}_cache.json")
+        cache = {}
+        
+        # 加载现有缓存
+        if os.path.exists(cache_path):
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                cache = json.load(f)
+        
+        # 更新缓存
+        cache[key] = {
+            'timestamp': time.time(),
+            'value': value
+        }
+        
+        # 保存缓存
+        self._save_cache(cache_type, cache)
+    
+    def _save_cache(self, cache_type, cache_data):
+        """保存缓存到文件"""
+        cache_path = os.path.join(self.cache_dir, f"{cache_type}_cache.json")
+        try:
+            with open(cache_path, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logging.error(f"{FIRE_ICONS['error']} 保存{cache_type}缓存失败: {str(e)}")
+    
+    def clear_cache(self, cache_type=None):
+        """清除缓存（指定类型或全部）"""
+        if cache_type:
+            cache_path = os.path.join(self.cache_dir, f"{cache_type}_cache.json")
+            if os.path.exists(cache_path):
+                os.remove(cache_path)
+            logging.info(f"{FIRE_ICONS['info']} {cache_type}缓存已清除")
+            return True
+        
+        # 清除全部缓存
+        for file_name in os.listdir(self.cache_dir):
+            if file_name.endswith('_cache.json'):
+                os.remove(os.path.join(self.cache_dir, file_name))
+        logging.info(f"{FIRE_ICONS['info']} 全部缓存已清除")
+        return True
+
+# -------------------------- 威胁情报分析器 --------------------------
+class 威胁情报分析器:
+    """集成VirusTotal、微步情报的威胁分析"""
+    def __init__(self, config_manager, cache_manager):
+        self.config = config_manager
+        self.cache = cache_manager
+        self.session = None
+        
+        # 加载API密钥
+        self.vt_key = self.config.get_threat_api_key('virustotal')
+        self.weibu_key = self.config.get_threat_api_key('weibu')
+    
+    async def init_session(self):
+        """初始化aiohttp会话"""
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+        return self.session
+    
+    async def analyze_ip(self, ip):
+        """分析IP威胁情报"""
+        # 先查缓存
+        cached = self.cache.get_cache('threat', f'ip_{ip}')
+        if cached:
+            cached['source'] = 'cache'
+            return cached
+        
+        # 多源分析
+        results = []
+        if self.vt_key:
+            vt_result = await self._vt_analyze_ip(ip)
+            if vt_result:
+                results.append(('virustotal', vt_result))
+        
+        if self.weibu_key:
+            weibu_result = await self._weibu_analyze_ip(ip)
+            if weibu_result:
+                results.append(('weibu', weibu_result))
+        
+        # 融合结果
+        if not results:
+            result = {
+                'ip': ip,
+                'risk_level': 'none',
+                'risk_label': f"{FIRE_COLORS['gold']}无风险{FIRE_COLORS['reset']}",
+                'detection_rate': 0,
+                'tags': [],
+                'source': 'none'
+            }
+        else:
+            result = self._merge_results(results, ip, is_ip=True)
+        
+        # 缓存结果
+        self.cache.set_cache('threat', f'ip_{ip}', result)
+        return result
+    
+    async def _vt_analyze_ip(self, ip):
+        """VirusTotal IP分析"""
+        try:
+            session = await self.init_session()
+            url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip}"
+            headers = {'x-apikey': self.vt_key}
+            
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                if resp.status != 200:
+                    return None
+                
+                data = await resp.json()
+                attrs = data['data']['attributes']
+                stats = attrs['last_analysis_stats']
+                
+                return {
+                    'risk': stats['malicious'] > 0,
+                    'detection_rate': (stats['malicious'] / stats['total']) * 100 if stats['total'] > 0 else 0,
+                    'tags': attrs.get('tags', []),
+                    'country': attrs.get('country', '未知')
+                }
+        except Exception as e:
+            logging.warning(f"{FIRE_ICONS['warning']} VT IP分析失败: {str(e)}")
+            return None
+    
+    async def _weibu_analyze_ip(self, ip):
+        """微步情报IP分析"""
+        try:
+            session = await self.init_session()
+            url = f"https://api.threatbook.cn/v3/ip/query"
+            params = {'apikey': self.weibu_key, 'resource': ip}
+            
+            async with session.get(url, params=params, timeout=10) as resp:
+                if resp.status != 200:
+                    return None
+                
+                data = await resp.json()
+                if data['response_code'] != 0:
+                    return None
+                
+                return {
+                    'risk': data['data']['judgment'] == 'malicious',
+                    'detection_rate': data['data'].get('confidence', 0),
+                    'tags': data['data'].get('tags', []),
+                    'country': data['data']['location'].get('country', '未知')
+                }
+        except Exception as e:
+            logging.warning(f"{FIRE_ICONS['warning']} 微步IP分析失败: {str(e)}")
+            return None
+    
+    async def analyze_url(self, url):
+        """分析URL威胁情报"""
+        # 先查缓存
+        cached = self.cache.get_cache('threat', f'url_{url}')
+        if cached:
+            cached['source'] = 'cache'
+            return cached
+        
+        # 多源分析
+        results = []
+        if self.vt_key:
+            vt_result = await self._vt_analyze_url(url)
+            if vt_result:
+                results.append(('virustotal', vt_result))
+        
+        if self.weibu_key:
+            weibu_result = await self._weibu_analyze_url(url)
+            if weibu_result:
+                results.append(('weibu', weibu_result))
+        
+        # 融合结果
+        if not results:
+            result = {
+                'url': url,
+                'risk_level': 'none',
+                'risk_label': f"{FIRE_COLORS['gold']}无风险{FIRE_COLORS['reset']}",
+                'detection_rate': 0,
+                'tags': [],
+                'source': 'none'
+            }
+        else:
+            result = self._merge_results(results, url, is_ip=False)
+        
+        # 缓存结果
+        self.cache.set_cache('threat', f'url_{url}', result)
+        return result
+    
+    async def _vt_analyze_url(self, url):
+        """VirusTotal URL分析"""
+        try:
+            session = await self.init_session()
+            # VT URL分析需先编码URL
+            url_id = base64.urlsafe_b64encode(url.encode()).decode().strip('=')
+            url = f"https://www.virustotal.com/api/v3/urls/{url_id}"
+            headers = {'x-apikey': self.vt_key}
+            
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                if resp.status != 200:
+                    return None
+                
+                data = await resp.json()
+                attrs = data['data']['attributes']
+                stats = attrs['last_analysis_stats']
+                
+                return {
+                    'risk': stats['malicious'] > 0,
+                    'detection_rate': (stats['malicious'] / stats['total']) * 100 if stats['total'] > 0 else 0,
+                    'tags': attrs.get('tags', []),
+                    'reputation': attrs.get('reputation', 0)
+                }
+        except Exception as e:
+            logging.warning(f"{FIRE_ICONS['warning']} VT URL分析失败: {str(e)}")
+            return None
+    
+    async def _weibu_analyze_url(self, url):
+        """微步情报URL分析"""
+        try:
+            session = await self.init_session()
+            url = f"https://api.threatbook.cn/v3/url/query"
+            params = {'apikey': self.weibu_key, 'resource': url}
+            
+            async with session.get(url, params=params, timeout=10) as resp:
+                if resp.status != 200:
+                    return None
+                
+                data = await resp.json()
+                if data['response_code'] != 0:
+                    return None
+                
+                return {
+                    'risk': data['data']['judgment'] == 'malicious',
+                    'detection_rate': data['data'].get('confidence', 0),
+                    'tags': data['data'].get('tags', []),
+                    'category': data['data'].get('category', '未知')
+                }
+        except Exception as e:
+            logging.warning(f"{FIRE_ICONS['warning']} 微步URL分析失败: {str(e)}")
+            return None
+    
+    def _merge_results(self, results, target, is_ip=True):
+        """融合多源威胁情报结果"""
+        merged = {
+            'risk_level': 'none',
+            'risk_label': f"{FIRE_COLORS['gold']}无风险{FIRE_COLORS['reset']}",
+            'detection_rate': 0,
+            'tags': [],
+            'sources': [r[0] for r in results],
+            'detail': results
+        }
+        
+        if is_ip:
+            merged['ip'] = target
+        else:
+            merged['url'] = target
+        
+        # 计算平均检测率
+        total_rate = sum(r[1]['detection_rate'] for r in results)
+        merged['detection_rate'] = round(total_rate / len(results), 2)
+        
+        # 合并标签
+        all_tags = []
+        for _, result in results:
+            all_tags.extend(result['tags'])
+        merged['tags'] = list(set(all_tags))  # 去重
+        
+        # 判断风险级别
+        if merged['detection_rate'] > 70:
+            merged['risk_level'] = 'high'
+            merged['risk_label'] = f"{FIRE_COLORS['red']}高风险{FIRE_COLORS['reset']}"
+        elif merged['detection_rate'] > 30:
+            merged['risk_level'] = 'medium'
+            merged['risk_label'] = f"{FIRE_COLORS['orange']}中风险{FIRE_COLORS['reset']}"
+        elif merged['detection_rate'] > 0:
+            merged['risk_level'] = 'low'
+            merged['risk_label'] = f"{FIRE_COLORS['yellow']}低风险{FIRE_COLORS['reset']}"
+        
+        return merged
+    
+    async def close(self):
+        """关闭会话"""
+        if self.session:
+            await self.session.close()
+
+# -------------------------- ICP备案查询器（阿里云API优化版） --------------------------
+class ICP备案查询器:
+    """多源ICP备案查询（含阿里云官方API、工信部接口）"""
+    def __init__(self, config_manager, cache_manager):
+        self.config = config_manager
+        self.cache = cache_manager
+        self.session = None
+        
+        # 加载阿里云配置
+        self.aliyun_config = self.config.get_aliyun_config()
+        self.aliyun_enabled = bool(self.aliyun_config['AccessKeyId'] and self.aliyun_config['AccessKeySecret'])
+        
+        # 工信部接口配置
+        self.miit_base_url = "https://hlwicpfwc.miit.gov.cn/icpproject_query/api"
+        self.miit_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Origin': 'https://beian.miit.gov.cn',
+            'Referer': 'https://beian.miit.gov.cn/',
+            'Content-Type': 'application/json;charset=UTF-8'
+        }
+        self.miit_initialized = False
+    
+    async def init_session(self):
+        """初始化会话"""
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+        return self.session
+    
+    # -------------------------- 阿里云备案查询（按官方文档实现） --------------------------
+    async def query_aliyun_icp(self, domain):
+        """
+        阿里云备案查询（官方API）
+        接口文档：https://developer.aliyun.com/article/1670298#section-3
+        """
+        if not self.aliyun_enabled:
+            logging.warning(f"{FIRE_ICONS['warning']} 阿里云备案API未配置（需AccessKeyId和AccessKeySecret）")
+            return None
+        
+        # 先查缓存
+        cached = self.cache.get_cache('icp', f'aliyun_{domain}')
+        if cached:
+            cached['source'] = 'aliyun_cache'
+            return cached
+        
+        try:
+            session = await self.init_session()
+            
+            # 1. 构建业务参数（官方必传参数）
+            params = {
+                'Action': 'QueryDomainBeianInfo',  # 官方接口名称
+                'DomainName': domain,             # 待查询域名
+                'AccessKeyId': self.aliyun_config['AccessKeyId'],
+                'ApiVersion': self.aliyun_config['ApiVersion'],
+                'RegionId': self.aliyun_config['RegionId']
+            }
+            
+            # 2. 生成签名URL
+            request_url = 阿里云签名工具.build_request_url(
+                params, 
+                self.aliyun_config['AccessKeySecret']
+            )
+            
+            # 3. 发送请求
+            async with session.get(request_url, timeout=15) as resp:
+                if resp.status != 200:
+                    logging.error(f"{FIRE_ICONS['error']} 阿里云API请求失败（状态码: {resp.status}）")
+                    return None
+                
+                data = await resp.json()
+                return self._parse_aliyun_response(data, domain)
+        
+        except Exception as e:
+            logging.error(f"{FIRE_ICONS['error']} 阿里云备案查询失败: {str(e)}")
+            return None
+    
+    def _parse_aliyun_response(self, data, domain):
+        """解析阿里云备案API响应（按官方返回格式）"""
+        # 官方成功响应格式：{"RequestId":"xxx","DomainBeianInfo":{"..."},"Success":true}
+        if not data.get('Success'):
+            error_msg = data.get('Message', '未知错误')
+            error_code = data.get('Code', '未知错误码')
+            logging.warning(f"{FIRE_ICONS['warning']} 阿里云备案查询无结果: {error_msg}（错误码: {error_code}）")
+            
+            # 明确标注未备案状态
+            result = {
+                'domain': domain,
+                'has_icp': False,
+                '备案状态': '未备案',
+                'source': 'aliyun',
+                'message': f"{error_msg}（错误码: {error_code}）"
+            }
+            self.cache.set_cache('icp', f'aliyun_{domain}', result)
+            return result
+        
+        # 解析备案信息（官方返回字段）
+        beian_info = data.get('DomainBeianInfo', {})
+        result = {
+            'domain': domain,
+            'has_icp': True,
+            '备案状态': '已备案',
+            'source': 'aliyun',
+            'license': beian_info.get('ServiceLicense', '未知'),  # 备案许可证号
+            'unit': beian_info.get('UnitName', '未知'),          # 主办单位名称
+            'unit_type': beian_info.get('UnitType', '未知'),    # 单位类型（企业/个人）
+            'website_name': beian_info.get('WebsiteName', '未知'),  # 网站名称
+            'website_type': beian_info.get('WebsiteType', '未知'),  # 网站类型
+            'update_time': beian_info.get('UpdateTime', time.strftime('%Y-%m-%d %H:%M:%S')),  # 最后更新时间
+            'service_type': beian_info.get('ServiceType', '未知'),  # 服务类型
+            'main_domain': beian_info.get('MainDomain', domain)     # 主域名
+        }
+        
+        # 缓存结果
+        self.cache.set_cache('icp', f'aliyun_{domain}', result)
+        return result
+    
+    # -------------------------- 工信部备案查询 --------------------------
+    async def query_miit_icp(self, domain):
+        """工信部备案查询（备用接口）"""
+        # 先查缓存
+        cached = self.cache.get_cache('icp', f'miit_{domain}')
+        if cached:
+            cached['source'] = 'miit_cache'
+            return cached
+        
+        # 初始化工信部会话
+        if not self.miit_initialized:
+            if not await self._init_miit_session():
+                logging.warning(f"{FIRE_ICONS['warning']} 工信部接口初始化失败，将跳过该源查询")
+                return None
+        
+        try:
+            session = await self.init_session()
+            
+            # 多条件查询提高准确性
+            for service_type in [1, 0]:  # 1:网站, 0:全部类型
+                data = {
+                    "pageNum": 1,
+                    "pageSize": 20,
+                    "unitName": "",
+                    "serviceType": service_type,
+                    "domainName": domain
+                }
+                
+                async with session.post(
+                    f"{self.miit_base_url}/icpAbbreviateInfo/queryByCondition",
+                    json=data,
+                    headers=self.miit_headers,
+                    timeout=15
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    
+                    data = await resp.json()
+                    parsed = self._parse_miit_response(data, domain)
+                    if parsed:
+                        self.cache.set_cache('icp', f'miit_{domain}', parsed)
+                        return parsed
+            
+            # 无结果时返回未备案
+            result = {
+                'domain': domain,
+                'has_icp': False,
+                '备案状态': '未备案',
+                'source': 'miit',
+                'message': '工信部接口未查询到备案信息'
+            }
+            self.cache.set_cache('icp', f'miit_{domain}', result)
+            return result
+        
+        except Exception as e:
+            logging.error(f"{FIRE_ICONS['error']} 工信部备案查询失败: {str(e)}")
+            return None
+    
+    async def _init_miit_session(self):
+        """初始化工信部接口会话（处理Cookie和Token）"""
+        try:
+            session = await self.init_session()
+            
+            # 1. 获取基础Cookie
+            async with session.get("https://beian.miit.gov.cn/") as resp:
+                cookies = resp.cookies
+                cookie_list = []
+                for cookie in cookies:
+                    cookie_list.append(f"{cookie.name}={cookie.value}")
+                    if cookie.name.startswith("__jsluid_s"):
+                        self.miit_headers['Cookie'] = "; ".join(cookie_list)
+                        break
+            
+            # 2. 获取认证Token
+            timestamp = round(time.time() * 1000)
+            auth_key = hashlib.md5(f"testtest{timestamp}".encode()).hexdigest()
+            auth_data = {"authKey": auth_key, "timeStamp": timestamp}
+            
+            async with session.post(
+                f"{self.miit_base_url}/auth",
+                json=auth_data,
+                headers=self.miit_headers
+            ) as resp:
+                data = await resp.json()
+                if data.get("success"):
+                    self.miit_headers['Token'] = data["params"]["bussiness"]
+                    self.miit_initialized = True
+                    return True
+            
+            return False
+        except Exception as e:
+            logging.error(f"{FIRE_ICONS['error']} 工信部会话初始化失败: {str(e)}")
+            return False
+    
+    def _parse_miit_response(self, data, domain):
+        """解析工信部接口响应"""
+        if data.get("code") != 200:
+            return {
+                'domain': domain,
+                'has_icp': False,
+                '备案状态': '未备案',
+                'source': 'miit',
+                'message': data.get("msg", "查询失败")
+            }
+        
+        records = data.get("params", {}).get("list", [])
+        if not records:
+            return {
+                'domain': domain,
+                'has_icp': False,
+                '备案状态': '未备案',
+                'source': 'miit',
+                'message': '未查询到备案信息'
+            }
+        
+        # 提取主域名进行匹配
+        ext = tldextract.extract(domain)
+        main_domain = f"{ext.domain}.{ext.suffix}"
+        matched = None
+        
+        for record in records:
+            record_domain = record.get("domain", "").lower()
+            record_ext = tldextract.extract(record_domain)
+            record_main = f"{record_ext.domain}.{record_ext.suffix}"
+            
+            if record_main == main_domain:
+                matched = record
+                break
+        
+        if not matched:
+            matched = records[0]
+        
+        return {
+            'domain': domain,
+            'has_icp': True,
+            '备案状态': '已备案',
+            'source': 'miit',
+            'license': matched.get("serviceLicence", "未知"),
+            'unit': matched.get("unitName", "未知"),
+            'unit_type': matched.get("unitType", "未知"),
+            'website_name': matched.get("serviceName", "未知"),
+            'update_time': matched.get("updateRecordTime", "未知")
+        }
+    
+    # -------------------------- 多源融合查询 --------------------------
+    async def query_icp(self, domain):
+        """多源融合备案查询（优先阿里云，次选工信部）"""
+        # 1. 优先使用阿里云查询
+        if self.aliyun_enabled:
+            aliyun_result = await self.query_aliyun_icp(domain)
+            if aliyun_result:
+                # 若阿里云返回未备案，尝试工信部二次确认
+                if not aliyun_result['has_icp']:
+                    miit_result = await self.query_miit_icp(domain)
+                    if miit_result and miit_result['has_icp']:
+                        aliyun_result['has_icp'] = True
+                        aliyun_result['备案状态'] = '已备案'
+                        aliyun_result['secondary_source'] = 'miit'
+                        aliyun_result['message'] = '阿里云未查到，工信部确认已备案'
+                return aliyun_result
+        
+        # 2. 阿里云不可用时使用工信部
+        miit_result = await self.query_miit_icp(domain)
+        if miit_result:
+            return miit_result
+        
+        # 3. 所有源失败
+        return {
+            'domain': domain,
+            'has_icp': False,
+            '备案状态': '未备案',
+            'source': 'none',
+            'message': '所有备案查询源均失败'
+        }
+    
+    async def close(self):
+        """关闭会话"""
+        if self.session:
+            await self.session.close()
+
+# -------------------------- IP与DNS查询器 --------------------------
+class IP_DNS查询器:
+    """IP信息查询与DNS解析"""
+    def __init__(self, cache_manager):
+        self.cache = cache_manager
+        self.session = None
+        
+        # 多源IP查询API
+        self.ip_apis = [
+            {
+                'name': 'ip-api',
+                'url': 'http://ip-api.com/json/{ip}?fields=status,country,regionName,city,isp,org,as,asname,query',
+                'timeout': 8
+            },
+            {
+                'name': 'ipinfo',
+                'url': 'https://ipinfo.io/{ip}/json',
+                'timeout': 8
+            },
+            {
+                'name': 'taobao',
+                'url': 'https://ip.taobao.com/outGetIpInfo?ip={ip}&accessKey=alibaba-inc',
+                'timeout': 6
+            }
+        ]
+    
+    async def init_session(self):
+        """初始化会话"""
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+        return self.session
+    
+    async def resolve_dns(self, domain):
+        """解析域名DNS（多方法）- 已删除URL有效性判断"""
+        # 先查缓存
+        cached = self.cache.get_cache('ip', f'dns_{domain}')
+        if cached:
+            return cached
+        
+        ips = set()
+        
+        # 1. 系统DNS解析（直接解析，不做URL有效性判断）
+        try:
+            addr_info = socket.getaddrinfo(domain, None, socket.AF_INET)
+            for info in addr_info:
+                ips.add(info[4][0])
+        except Exception as e:
+            logging.warning(f"{FIRE_ICONS['warning']} 系统DNS解析失败: {str(e)}")
+        
+        # 2. 结果处理
+        result = {
+            'domain': domain,
+            'primary_ip': list(ips)[0] if ips else None,
+            'ips': list(ips),
+            'ip_count': len(ips),
+            'is_cdn': len(ips) > 3,  # 简单判断CDN
+            'resolve_time': time.strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        # 缓存结果
+        self.cache.set_cache('ip', f'dns_{domain}', result)
+        return result
+    
+    async def query_ip_info(self, ip):
+        """多源查询IP信息"""
+        # 先查缓存
+        cached = self.cache.get_cache('ip', f'info_{ip}')
+        if cached:
+            return cached
+        
+        session = await self.init_session()
+        results = []
+        
+        # 多源查询
+        for api in self.ip_apis:
+            try:
+                url = api['url'].format(ip=ip)
+                async with session.get(url, timeout=api['timeout']) as resp:
+                    if resp.status != 200:
+                        continue
+                    
+                    data = await resp.json()
+                    parsed = self._parse_ip_api_response(api['name'], data, ip)
+                    if parsed:
+                        results.append(parsed)
+            except Exception as e:
+                logging.warning(f"{FIRE_ICONS['warning']} {api['name']} IP查询失败: {str(e)}")
+        
+        # 融合结果
+        if not results:
+            result = {
+                'ip': ip,
+                'country': '未知',
+                'region': '未知',
+                'city': '未知',
+                'isp': '未知',
+                'asn': '未知',
+                'as_name': '未知',
+                'source': 'none'
+            }
+        else:
+            result = self._merge_ip_results(results, ip)
+        
+        # 缓存结果
+        self.cache.set_cache('ip', f'info_{ip}', result)
+        return result
+    
+    def _parse_ip_api_response(self, api_name, data, ip):
+        """解析IP查询API响应"""
+        if api_name == 'ip-api':
+            if data.get('status') != 'success':
+                return None
+            return {
+                'country': data.get('country', '未知'),
+                'region': data.get('regionName', '未知'),
+                'city': data.get('city', '未知'),
+                'isp': data.get('isp', '未知'),
+                'asn': data.get('as', '未知'),
+                'as_name': data.get('asname', '未知'),
+                'source': api_name
+            }
+        
+        elif api_name == 'ipinfo':
+            return {
+                'country': data.get('country', '未知'),
+                'region': data.get('region', '未知'),
+                'city': data.get('city', '未知'),
+                'isp': data.get('org', '未知'),
+                'asn': data.get('asn', '未知').replace('AS', '') if data.get('asn') else '未知',
+                'as_name': data.get('asn', '未知') if data.get('asn') else '未知',
+                'source': api_name
+            }
+        
+        elif api_name == 'taobao':
+            if data.get('code') != 0:
+                return None
+            data = data.get('data', {})
+            return {
+                'country': data.get('country', '未知'),
+                'region': data.get('region', '未知'),
+                'city': data.get('city', '未知'),
+                'isp': data.get('isp', '未知'),
+                'asn': '未知',
+                'as_name': '未知',
+                'source': api_name
+            }
+        
+        return None
+    
+    def _merge_ip_results(self, results, ip):
+        """融合多源IP信息"""
+        merged = {
+            'ip': ip,
+            'country': [],
+            'region': [],
+            'city': [],
+            'isp': [],
+            'asn': [],
+            'as_name': [],
+            'sources': []
+        }
+        
+        # 收集所有结果
+        for result in results:
+            merged['sources'].append(result['source'])
+            for key in ['country', 'region', 'city', 'isp', 'asn', 'as_name']:
+                if result[key] and result[key] != '未知':
+                    merged[key].append(result[key])
+        
+        # 按出现频率选择最可能值
+        for key in ['country', 'region', 'city', 'isp', 'asn', 'as_name']:
+            if merged[key]:
+                # 选择出现次数最多的值
+                merged[key] = max(set(merged[key]), key=merged[key].count)
+            else:
+                merged[key] = '未知'
+        
+        merged['sources'] = ', '.join(list(set(merged['sources'])))
+        return merged
+    
+    async def close(self):
+        """关闭会话"""
+        if self.session:
+            await self.session.close()
+
+# -------------------------- URL扫描器（核心业务-删除URL有效性判断） --------------------------
+class URL扫描器:
+    """URL扫描核心（含连接性检查、备案查询、威胁分析）- 已删除URL有效性判断"""
+    def __init__(self, config, cache, history, right_printer):
+        self.config = config
+        self.cache = cache
+        self.history = history
+        self.right_printer = right_printer
+        
+        # 初始化组件
+        self.icp_query = ICP备案查询器(config, cache)
+        self.ip_dns_query = IP_DNS查询器(cache)
+        self.threat_analyzer = 威胁情报分析器(config, cache)
+        
+        # 加载系统设置
+        self.timeout = int(self.config.get_system_setting('timeout', 15))
+        self.print_delay = float(self.config.get_system_setting('print_delay', 0.05))
+        self.auto_save = self.config.get_system_setting('auto_save_csv', 'True') == 'True'
+        
+        self.results = []
+    
+    async def init_scanner(self):
+        """初始化扫描器组件"""
+        await self.icp_query.init_session()
+        await self.ip_dns_query.init_session()
+        await self.threat_analyzer.init_session()
+        return True
+    
+    async def scan_single_url(self, url, enable_icp=True, enable_threat=True):
+        """扫描单个URL - 已删除URL有效性判断"""
+        # 1. 标准化URL（仅补充协议，不做有效性判断）
+        normalized_url = self._normalize_url(url)
+        parsed = urlparse(normalized_url)
+        domain = parsed.netloc if parsed.netloc else url  # 无域名时直接使用原始URL
+        logging.info(f"{FIRE_ICONS['check']} 开始扫描: {url}")
+        
+        # 2. 初始化结果结构
+        result = {
+            'original_url': url,
+            'normalized_url': normalized_url,
+            'domain': domain,
+            'scan_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'dns_info': {},
+            'ip_info': {},
+            'http_check': {},
+            'https_check': {},
+            'icp_info': {},
+            'threat_info': {}
+        }
+        
+        # 3. DNS解析（不做URL有效性判断，直接尝试解析）
+        logging.info(f"{FIRE_ICONS['ip']} 解析DNS: {domain}")
+        dns_result = await self.ip_dns_query.resolve_dns(domain)
+        result['dns_info'] = dns_result
+        
+        # 4. IP信息查询
+        if dns_result['primary_ip']:
+            logging.info(f"{FIRE_ICONS['ip']} 查询IP信息: {dns_result['primary_ip']}")
+            ip_info = await self.ip_dns_query.query_ip_info(dns_result['primary_ip'])
+            result['ip_info'] = ip_info
+        
+        # 5. HTTP/HTTPS连接性检查
+        logging.info(f"{FIRE_ICONS['check']} 检查连接性: {domain}")
+        result['http_check'] = await self._check_protocol(normalized_url, 'http')
+        result['https_check'] = await self._check_protocol(normalized_url, 'https')
+        
+        # 6. ICP备案查询
+        if enable_icp:
+            logging.info(f"{FIRE_ICONS['icp']} 查询备案信息: {domain}")
+            result['icp_info'] = await self.icp_query.query_icp(domain)
+        
+        # 7. 威胁情报分析
+        if enable_threat and dns_result['primary_ip']:
+            logging.info(f"{FIRE_ICONS['threat']} 分析威胁情报")
+            result['threat_info']['ip'] = await self.threat_analyzer.analyze_ip(dns_result['primary_ip'])
+            result['threat_info']['url'] = await self.threat_analyzer.analyze_url(normalized_url)
+        
+        # 8. 保存结果
+        self.results.append(result)
+        logging.info(f"{FIRE_ICONS['success']} 扫描完成: {url}")
+        
+        # 9. 显示结果摘要
+        self._show_result_summary(result)
+        
+        return result
+    
+    async def scan_batch_url(self, url_list, enable_icp=True, enable_threat=True):
+        """批量扫描URL - 已删除URL有效性判断"""
+        total = len(url_list)
+        
+        if total == 0:
+            logging.error(f"{FIRE_ICONS['error']} 无URL可扫描")
+            return []
+        
+        logging.info(f"{FIRE_ICONS['check']} 批量扫描开始，共{total}个URL")
+        
+        # 并发扫描（控制并发数）
+        semaphore = asyncio.Semaphore(int(self.config.get_system_setting('default_workers', 3)))
+        
+        async def _safe_scan(url):
+            async with semaphore:
+                result = await self.scan_single_url(url, enable_icp, enable_threat)
+                # 控制打印速度
+                await asyncio.sleep(self.print_delay)
+                return result
+        
+        tasks = [_safe_scan(url) for url in url_list]
+        results = await asyncio.gather(*tasks)
+        
+        # 过滤None结果
+        self.results = [r for r in results if r is not None]
+        
+        # 保存结果
+        if self.auto_save:
+            self._save_results_to_csv()
+        
+        # 保存历史
+        self.history.save_history(self.results, 'batch', f'{total}_urls')
+        
+        # 显示扫描总结
+        self._show_scan_summary()
+        
+        return self.results
+    
+    def _normalize_url(self, url):
+        """标准化URL（仅补充协议，不做有效性判断）"""
+        url = url.strip()
+        # 无协议时默认补充HTTPS
+        if not urlparse(url).scheme:
+            return f"https://{url}"
+        return url
+    
+    async def _check_protocol(self, url, protocol):
+        """检查指定协议的连接性"""
+        parsed = urlparse(url)
+        # 替换协议（不做URL有效性判断，直接尝试连接）
+        check_url = urlunparse((protocol, parsed.netloc or parsed.path, parsed.path, 
+                                parsed.params, parsed.query, parsed.fragment))
+        
+        result = {
+            'url': check_url,
+            'status_code': None,
+            'accessible': False,
+            'response_time': 0,
+            'redirect_count': 0,
+            'final_url': check_url,
+            'error': ''
+        }
+        
+        try:
+            start_time = time.time()
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    check_url,
+                    timeout=self.timeout,
+                    allow_redirects=True,
+                    headers=headers,
+                    ssl=False
+                ) as resp:
+                    result['status_code'] = resp.status
+                    result['accessible'] = resp.status == 200
+                    result['redirect_count'] = len(resp.history)
+                    result['final_url'] = str(resp.url)
+                    result['response_time'] = round(time.time() - start_time, 3)
+        
+        except Exception as e:
+            result['error'] = str(e)
+            result['response_time'] = round(time.time() - start_time, 3)
+        
+        return result
+    
+    def _save_results_to_csv(self):
+        """保存结果到CSV（工具同目录）"""
+        if not self.results:
+            logging.warning(f"{FIRE_ICONS['warning']} 无结果可保存")
+            return None
+        
+        # 生成CSV文件名
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        csv_path = os.path.join(CSV_OUTPUT_DIR, f'scan_result_{timestamp}.csv')
+        
+        # 定义CSV字段（完整字段）
+        fieldnames = [
+            # 基础信息
+            'original_url', 'normalized_url', 'domain', 'scan_time',
+            # DNS信息
+            'dns_primary_ip', 'dns_ips', 'dns_ip_count', 'dns_is_cdn',
+            # IP信息
+            'ip_country', 'ip_region', 'ip_city', 'ip_isp', 'ip_asn', 'ip_as_name', 'ip_source',
+            # HTTP检查
+            'http_url', 'http_status', 'http_accessible', 'http_response_time', 'http_error',
+            # HTTPS检查
+            'https_url', 'https_status', 'https_accessible', 'https_response_time', 'https_error',
+            # ICP信息
+            'icp_has_record', 'icp_status', 'icp_license', 'icp_unit', 'icp_source', 'icp_message',
+            # 威胁情报
+            'threat_ip_level', 'threat_ip_rate', 'threat_url_level', 'threat_url_rate'
+        ]
+        
+        try:
+            with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                for result in self.results:
+                    # 提取ICP信息
+                    icp = result['icp_info']
+                    # 提取威胁信息
+                    ip_threat = result['threat_info'].get('ip', {})
+                    url_threat = result['threat_info'].get('url', {})
+                    
+                    writer.writerow({
+                        # 基础信息
+                        'original_url': result['original_url'],
+                        'normalized_url': result['normalized_url'],
+                        'domain': result['domain'],
+                        'scan_time': result['scan_time'],
+                        # DNS信息
+                        'dns_primary_ip': result['dns_info'].get('primary_ip', ''),
+                        'dns_ips': ', '.join(result['dns_info'].get('ips', [])),
+                        'dns_ip_count': result['dns_info'].get('ip_count', 0),
+                        'dns_is_cdn': result['dns_info'].get('is_cdn', False),
+                        # IP信息
+                        'ip_country': result['ip_info'].get('country', ''),
+                        'ip_region': result['ip_info'].get('region', ''),
+                        'ip_city': result['ip_info'].get('city', ''),
+                        'ip_isp': result['ip_info'].get('isp', ''),
+                        'ip_asn': result['ip_info'].get('asn', ''),
+                        'ip_as_name': result['ip_info'].get('as_name', ''),
+                        'ip_source': result['ip_info'].get('sources', ''),
+                        # HTTP检查
+                        'http_url': result['http_check'].get('url', ''),
+                        'http_status': result['http_check'].get('status_code', ''),
+                        'http_accessible': result['http_check'].get('accessible', False),
+                        'http_response_time': result['http_check'].get('response_time', 0),
+                        'http_error': result['http_check'].get('error', ''),
+                        # HTTPS检查
+                        'https_url': result['https_check'].get('url', ''),
+                        'https_status': result['https_check'].get('status_code', ''),
+                        'https_accessible': result['https_check'].get('accessible', False),
+                        'https_response_time': result['https_check'].get('response_time', 0),
+                        'https_error': result['https_check'].get('error', ''),
+                        # ICP信息
+                        'icp_has_record': icp.get('has_icp', False),
+                        'icp_status': icp.get('备案状态', '未知'),
+                        'icp_license': icp.get('license', ''),
+                        'icp_unit': icp.get('unit', ''),
+                        'icp_source': icp.get('source', ''),
+                        'icp_message': icp.get('message', ''),
+                        # 威胁情报
+                        'threat_ip_level': ip_threat.get('risk_level', ''),
+                        'threat_ip_rate': ip_threat.get('detection_rate', 0),
+                        'threat_url_level': url_threat.get('risk_level', ''),
+                        'threat_url_rate': url_threat.get('detection_rate', 0)
+                    })
+            
+            logging.info(f"{FIRE_ICONS['flame']} 结果已保存: {csv_path}")
+            return csv_path
+        except Exception as e:
+            logging.error(f"{FIRE_ICONS['error']} 保存CSV失败: {str(e)}")
+            return None
+    
+    def _show_result_summary(self, result):
+        """显示结果摘要（右侧打印）"""
+        self.right_printer.print_to_right(f"\n{FIRE_SEPARATOR}")
+        self.right_printer.print_to_right(f"{FIRE_ICONS['success']} 扫描结果: {result['original_url']}")
+        self.right_printer.print_to_right(f"{FIRE_SEPARATOR}")
+        
+        # 基础信息
+        self.right_printer.print_to_right(f"标准化URL: {result['normalized_url']}")
+        self.right_printer.print_to_right(f"扫描时间: {result['scan_time']}")
+        
+        # DNS信息
+        dns = result['dns_info']
+        self.right_printer.print_to_right(f"\n{FIRE_ICONS['ip']} DNS信息:")
+        self.right_printer.print_to_right(f"主IP: {dns.get('primary_ip', '未知')}")
+        self.right_printer.print_to_right(f"IP总数: {dns.get('ip_count', 0)}")
+        self.right_printer.print_to_right(f"是否CDN: {'是' if dns.get('is_cdn') else '否'}")
+        
+        # IP信息
+        ip_info = result['ip_info']
+        if ip_info:
+            self.right_printer.print_to_right(f"\n{FIRE_ICONS['ip']} IP信息:")
+            self.right_printer.print_to_right(f"地理位置: {ip_info.get('country')} {ip_info.get('region')} {ip_info.get('city')}")
+            self.right_printer.print_to_right(f"运营商: {ip_info.get('isp')}")
+            self.right_printer.print_to_right(f"ASN: {ip_info.get('asn')} ({ip_info.get('as_name')})")
+        
+        # 连接性检查
+        self.right_printer.print_to_right(f"\n{FIRE_ICONS['check']} 连接性:")
+        http = result['http_check']
+        https = result['https_check']
+        self.right_printer.print_to_right(f"HTTP: {'可用' if http['accessible'] else '不可用'} (状态码: {http['status_code'] or '无'})")
+        self.right_printer.print_to_right(f"HTTPS: {'可用' if https['accessible'] else '不可用'} (状态码: {https['status_code'] or '无'})")
+        self.right_printer.print_to_right(f"响应时间: HTTP {http['response_time']}s | HTTPS {https['response_time']}s")
+        
+        # ICP备案信息
+        icp = result['icp_info']
+        if icp:
+            self.right_printer.print_to_right(f"\n{FIRE_ICONS['icp']} 备案信息:")
+            self.right_printer.print_to_right(f"备案状态: {icp.get('备案状态')}")
+            if icp.get('has_icp'):
+                self.right_printer.print_to_right(f"备案号: {icp.get('license')}")
+                self.right_printer.print_to_right(f"主办单位: {icp.get('unit')}")
+                self.right_printer.print_to_right(f"更新时间: {icp.get('update_time', '未知')}")
+            self.right_printer.print_to_right(f"查询源: {icp.get('source')}")
+        
+        # 威胁情报
+        threat = result['threat_info']
+        if threat:
+            self.right_printer.print_to_right(f"\n{FIRE_ICONS['threat']} 威胁情报:")
+            if 'ip' in threat and threat['ip']:
+                self.right_printer.print_to_right(f"IP风险: {threat['ip']['risk_label']} ({threat['ip']['detection_rate']}%)")
+            if 'url' in threat and threat['url']:
+                self.right_printer.print_to_right(f"URL风险: {threat['url']['risk_label']} ({threat['url']['detection_rate']}%)")
+            if threat.get('ip', {}).get('tags'):
+                self.right_printer.print_to_right(f"威胁标签: {', '.join(threat['ip']['tags'][:5])}{'...' if len(threat['ip']['tags'])>5 else ''}")
+        
+        self.right_printer.print_to_right(f"\n{FIRE_SEPARATOR}")
+    
+    def _show_scan_summary(self):
+        """显示批量扫描总结"""
+        if not self.results:
+            return
+        
+        total = len(self.results)
+        accessible = sum(1 for r in self.results if r['http_check']['accessible'] or r['https_check']['accessible'])
+        has_icp = sum(1 for r in self.results if r['icp_info'].get('has_icp', False))
+        high_risk = sum(1 for r in self.results if r['threat_info'].get('ip', {}).get('risk_level') == 'high' or 
+                       r['threat_info'].get('url', {}).get('risk_level') == 'high')
+        
+        self.right_printer.print_to_right(f"\n{FIRE_SEPARATOR}")
+        self.right_printer.print_to_right(f"{FIRE_ICONS['success']} 批量扫描完成 (共{total}个URL)")
+        self.right_printer.print_to_right(f"{FIRE_SEPARATOR}")
+        self.right_printer.print_to_right(f"可用URL: {accessible}/{total} ({round(accessible/total*100, 1)}%)")
+        self.right_printer.print_to_right(f"已备案URL: {has_icp}/{total} ({round(has_icp/total*100, 1)}%)")
+        self.right_printer.print_to_right(f"高风险URL: {high_risk}/{total} ({round(high_risk/total*100, 1)}%)")
+        self.right_printer.print_to_right(f"{FIRE_SEPARATOR}\n")
+
+# -------------------------- 主程序与菜单交互 --------------------------
+class 主程序:
+    """主程序入口与菜单交互"""
+    def __init__(self):
+        # 初始化组件
+        self.right_printer = 右侧打印管理器()
+        self.config = 配置管理器()
+        self.cache = 缓存管理器()
+        self.history = 历史数据管理器()
+        self.scanner = URL扫描器(self.config, self.cache, self.history, self.right_printer)
+        
+        # 初始化Colorama
+        init(autoreset=True)
+        
+        # 加载系统设置
+        self.show_banner = self.config.get_system_setting('show_banner', 'True') == 'True'
+    
+    def 显示_banner(self):
+        """显示火焰主题Banner"""
+        if not self.show_banner:
+            return
+            
+        print(f"\n{FIRE_COLORS['red']}=" * 60)
+        print(f"{FIRE_COLORS['red']}███████╗{FIRE_COLORS['orange']}██████╗ {FIRE_COLORS['yellow']}██████╗ {FIRE_COLORS['red']}███████╗{FIRE_COLORS['orange']}██████╗ {FIRE_COLORS['yellow']}██████╗ ")
+        print(f"{FIRE_COLORS['red']}██╔════╝{FIRE_COLORS['orange']}██╔══██╗{FIRE_COLORS['yellow']}██╔══██╗{FIRE_COLORS['red']}██╔════╝{FIRE_COLORS['orange']}██╔══██╗{FIRE_COLORS['yellow']}██╔══██╗")
+        print(f"{FIRE_COLORS['red']}█████╗  {FIRE_COLORS['orange']}██████╔╝{FIRE_COLORS['yellow']}██████╔╝{FIRE_COLORS['red']}█████╗  {FIRE_COLORS['orange']}██████╔╝{FIRE_COLORS['yellow']}██║  ██║")
+        print(f"{FIRE_COLORS['red']}██╔══╝  {FIRE_COLORS['orange']}██╔══██╗{FIRE_COLORS['yellow']}██╔══██╗{FIRE_COLORS['red']}██╔══╝  {FIRE_COLORS['orange']}██╔══██╗{FIRE_COLORS['yellow']}██║  ██║")
+        print(f"{FIRE_COLORS['red']}██║     {FIRE_COLORS['orange']}██║  ██║{FIRE_COLORS['yellow']}██████╔╝{FIRE_COLORS['red']}███████╗{FIRE_COLORS['orange']}██║  ██║{FIRE_COLORS['yellow']}██████╔╝")
+        print(f"{FIRE_COLORS['red']}╚═╝     {FIRE_COLORS['orange']}╚═╝  ╚═╝{FIRE_COLORS['yellow']}╚═════╝ {FIRE_COLORS['red']}╚══════╝{FIRE_COLORS['orange']}╚═╝  ╚═╝{FIRE_COLORS['yellow']}╚═════╝ ")
+        print(f"{FIRE_COLORS['red']}=" * 60)
+        print(f"{FIRE_COLORS['yellow']}  {TOOL_NAME} v{VERSION} | 作者: {AUTHOR} | 更新: {MODIFY_TIME}")
+        print(f"{FIRE_COLORS['red']}=" * 60 + f"{FIRE_COLORS['reset']}\n")
+    
+    def 显示主菜单(self):
+        """显示主菜单"""
+        self.right_printer.clear_right()
+        print(f"\n{FIRE_ICONS['menu']} {FIRE_COLORS['blue']}主菜单{FIRE_COLORS['reset']}")
+        print(f"{FIRE_SEPARATOR}")
+        print(f"  {FIRE_COLORS['yellow']}1. 单个URL扫描{FIRE_COLORS['reset']}")
+        print(f"  {FIRE_COLORS['yellow']}2. 批量URL扫描（从文件导入）{FIRE_COLORS['reset']}")
+        print(f"  {FIRE_COLORS['yellow']}3. 查看历史记录{FIRE_COLORS['reset']}")
+        print(f"  {FIRE_COLORS['yellow']}4. 配置管理{FIRE_COLORS['reset']}")
+        print(f"  {FIRE_COLORS['yellow']}5. 清除缓存{FIRE_COLORS['reset']}")
+        print(f"  {FIRE_COLORS['yellow']}0. 退出程序{FIRE_COLORS['reset']}")
+        print(f"{FIRE_SEPARATOR}")
+        return input(f"{FIRE_ICONS['menu']} 请选择功能 [0-5]: ")
+    
+    def 配置管理菜单(self):
+        """配置管理子菜单"""
+        while True:
+            print(f"\n{FIRE_ICONS['menu']} {FIRE_COLORS['blue']}配置管理{FIRE_COLORS['reset']}")
+            print(f"{FIRE_SEPARATOR}")
+            print(f"  {FIRE_COLORS['yellow']}1. 设置阿里云备案API{FIRE_COLORS['reset']}")
+            print(f"  {FIRE_COLORS['yellow']}2. 设置VirusTotal API{FIRE_COLORS['reset']}")
+            print(f"  {FIRE_COLORS['yellow']}3. 设置微步情报API{FIRE_COLORS['reset']}")
+            print(f"  {FIRE_COLORS['yellow']}4. 系统设置{FIRE_COLORS['reset']}")
+            print(f"  {FIRE_COLORS['yellow']}5. 查看当前配置{FIRE_COLORS['reset']}")
+            print(f"  {FIRE_COLORS['yellow']}0. 返回主菜单{FIRE_COLORS['reset']}")
+            print(f"{FIRE_SEPARATOR}")
+            
+            choice = input(f"{FIRE_ICONS['menu']} 请选择配置项 [0-5]: ")
+            
+            if choice == '0':
+                break
+            elif choice == '1':
+                self._设置阿里云API()
+            elif choice == '2':
+                self._设置威胁情报API('virustotal')
+            elif choice == '3':
+                self._设置威胁情报API('weibu')
+            elif choice == '4':
+                self._系统设置()
+            elif choice == '5':
+                self.config.显示配置信息()
+            else:
+                print(f"{FIRE_ICONS['error']} 无效选择，请重试")
+            
+            self.right_printer.等待用户按键()
+    
+    def _设置阿里云API(self):
+        """设置阿里云备案API密钥"""
+        print(f"\n{FIRE_ICONS['info']} 阿里云备案API配置（需注册阿里云账号并开通备案查询服务）")
+        access_key_id = input("请输入AccessKeyId: ").strip()
+        access_key_secret = input("请输入AccessKeySecret: ").strip()
+        region_id = input("请输入RegionId（默认cn-hangzhou）: ").strip() or 'cn-hangzhou'
+        
+        if self.config.set_aliyun_config(access_key_id, access_key_secret, region_id):
+            print(f"{FIRE_ICONS['success']} 阿里云API配置已保存")
+        else:
+            print(f"{FIRE_ICONS['error']} 阿里云API配置保存失败")
+    
+    def _设置威胁情报API(self, api_name):
+        """设置威胁情报API密钥"""
+        api_names = {
+            'virustotal': 'VirusTotal',
+            'weibu': '微步情报'
+        }
+        print(f"\n{FIRE_ICONS['info']} {api_names[api_name]} API配置")
+        api_key = input(f"请输入{api_names[api_name]} API密钥: ").strip()
+        
+        if self.config.set_threat_api_key(api_name, api_key):
+            print(f"{FIRE_ICONS['success']} {api_names[api_name]} API配置已保存")
+        else:
+            print(f"{FIRE_ICONS['error']} {api_names[api_name]} API配置保存失败")
+    
+    def _系统设置(self):
+        """系统设置"""
+        print(f"\n{FIRE_ICONS['info']} 系统设置")
+        print(f"  当前默认工作线程数: {self.config.get_system_setting('default_workers', '3')}")
+        workers = input("请输入新的默认工作线程数（1-10）: ").strip()
+        if workers and workers.isdigit() and 1 <= int(workers) <= 10:
+            self.config.set_system_setting('default_workers', workers)
+        
+        print(f"  当前超时时间: {self.config.get_system_setting('timeout', '15')}秒")
+        timeout = input("请输入新的超时时间（5-60秒）: ").strip()
+        if timeout and timeout.isdigit() and 5 <= int(timeout) <= 60:
+            self.config.set_system_setting('timeout', timeout)
+        
+        print(f"  当前自动保存CSV: {'是' if self.config.get_system_setting('auto_save_csv') == 'True' else '否'}")
+        auto_save = input("是否自动保存CSV结果（y/n）: ").strip().lower()
+        if auto_save in ['y', 'n']:
+            self.config.set_system_setting('auto_save_csv', 'True' if auto_save == 'y' else 'False')
+        
+        print(f"{FIRE_ICONS['success']} 系统设置已更新")
+    
+    async def 单个URL扫描流程(self):
+        """单个URL扫描流程"""
+        url = input(f"\n{FIRE_ICONS['check']} 请输入URL: ").strip()
+        if not url:
+            print(f"{FIRE_ICONS['error']} URL不能为空")
+            return
+        
+        # 确认扫描选项
+        enable_icp = input(f"{FIRE_ICONS['icp']} 是否查询备案信息（y/n，默认y）: ").strip().lower() != 'n'
+        enable_threat = input(f"{FIRE_ICONS['threat']} 是否进行威胁分析（y/n，默认y）: ").strip().lower() != 'n'
+        
+        # 初始化扫描器
+        await self.scanner.init_scanner()
+        
+        # 执行扫描
+        try:
+            self.right_printer.clear_right()
+            result = await self.scanner.scan_single_url(url, enable_icp, enable_threat)
+            
+            # 保存历史
+            self.history.save_history([result], 'single', url)
+            
+            # 手动保存选项
+            if not self.config.get_system_setting('auto_save_csv', 'True') == 'True':
+                save = input(f"{FIRE_ICONS['info']} 是否保存结果到CSV（y/n）: ").strip().lower()
+                if save == 'y':
+                    self.scanner._save_results_to_csv()
+        
+        except Exception as e:
+            logging.error(f"{FIRE_ICONS['error']} 扫描失败: {str(e)}")
+        
+        self.right_printer.等待用户按键()
+    
+    async def 批量URL扫描流程(self):
+        """批量URL扫描流程"""
+        file_path = input(f"\n{FIRE_ICONS['check']} 请输入URL列表文件路径: ").strip()
+        
+        # 验证文件
+        if not os.path.exists(file_path) or not os.path.isfile(file_path):
+            print(f"{FIRE_ICONS['error']} 文件不存在或不是有效文件")
+            return
+        
+        # 读取URL列表
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                urls = [line.strip() for line in f if line.strip()]
+            
+            if not urls:
+                print(f"{FIRE_ICONS['error']} 文件中未找到有效URL")
+                return
+            
+            print(f"{FIRE_ICONS['info']} 共读取到 {len(urls)} 个URL")
+        except Exception as e:
+            print(f"{FIRE_ICONS['error']} 读取文件失败: {str(e)}")
+            return
+        
+        # 确认扫描选项
+        enable_icp = input(f"{FIRE_ICONS['icp']} 是否查询备案信息（y/n，默认y）: ").strip().lower() != 'n'
+        enable_threat = input(f"{FIRE_ICONS['threat']} 是否进行威胁分析（y/n，默认y）: ").strip().lower() != 'n'
+        
+        # 初始化扫描器
+        await self.scanner.init_scanner()
+        
+        # 执行扫描
+        try:
+            self.right_printer.clear_right()
+            await self.scanner.scan_batch_url(urls, enable_icp, enable_threat)
+        
+        except Exception as e:
+            logging.error(f"{FIRE_ICONS['error']} 批量扫描失败: {str(e)}")
+        
+        self.right_printer.等待用户按键()
+    
+    def 查看历史记录流程(self):
+        """查看历史记录流程"""
+        while True:
+            if not self.history.显示历史列表():
+                self.right_printer.等待用户按键()
+                break
+            
+            try:
+                choice = input(f"{FIRE_ICONS['menu']} 请选择: ").strip()
+                if choice == '0':
+                    break
+                
+                index = int(choice) - 1
+                history_list = self.history.get_history_list()
+                
+                if 0 <= index < len(history_list):
+                    history_id = history_list[index]['history_id']
+                    detail = self.history.get_history_detail(history_id)
+                    
+                    if detail:
+                        self._显示历史详情(detail)
+                        self.right_printer.等待用户按键()
+                else:
+                    print(f"{FIRE_ICONS['error']} 无效编号")
+                    self.right_printer.等待用户按键()
+            
+            except ValueError:
+                print(f"{FIRE_ICONS['error']} 请输入有效数字")
+                self.right_printer.等待用户按键()
+            except Exception as e:
+                print(f"{FIRE_ICONS['error']} 操作失败: {str(e)}")
+                self.right_printer.等待用户按键()
+    
+    def _显示历史详情(self, detail):
+        """显示历史记录详情"""
+        print(f"\n{FIRE_SEPARATOR}")
+        print(f"{FIRE_ICONS['flame']} {FIRE_COLORS['purple']}历史详情 (ID: {detail['history_id']}){FIRE_COLORS['reset']}")
+        print(f"{FIRE_SEPARATOR}")
+        print(f"  扫描时间: {detail['timestamp']}")
+        print(f"  扫描类型: {detail['scan_type']}")
+        print(f"  扫描目标: {detail['target']}")
+        print(f"  结果数量: {detail['result_count']}")
+        print(f"\n{FIRE_COLORS['yellow']}是否显示完整结果列表？(y/n){FIRE_COLORS['reset']}")
+        
+        if input().strip().lower() == 'y':
+            for i, result in enumerate(detail['results'], 1):
+                print(f"\n{FIRE_COLORS['orange']}----- 结果 {i}/{detail['result_count']} -----{FIRE_COLORS['reset']}")
+                print(f"URL: {result['original_url']}")
+                print(f"备案状态: {result['icp_info'].get('备案状态', '未知')}")
+                print(f"威胁等级: {result['threat_info'].get('ip', {}).get('risk_label', '未知')}")
+                print(f"连接状态: {'可用' if result['http_check']['accessible'] or result['https_check']['accessible'] else '不可用'}")
+        
+        print(f"\n{FIRE_ICONS['info']} 是否导出该历史记录到CSV？(y/n)")
+        if input().strip().lower() == 'y':
+            # 临时保存结果并导出
+            self.scanner.results = detail['results']
+            self.scanner._save_results_to_csv()
+    
+    def 清除缓存流程(self):
+        """清除缓存流程"""
+        print(f"\n{FIRE_ICONS['info']} 缓存管理")
+        print(f"{FIRE_SEPARATOR}")
+        print(f"  {FIRE_COLORS['yellow']}1. 清除ICP备案缓存{FIRE_COLORS['reset']}")
+        print(f"  {FIRE_COLORS['yellow']}2. 清除IP信息缓存{FIRE_COLORS['reset']}")
+        print(f"  {FIRE_COLORS['yellow']}3. 清除威胁情报缓存{FIRE_COLORS['reset']}")
+        print(f"  {FIRE_COLORS['yellow']}4. 清除全部缓存{FIRE_COLORS['reset']}")
+        print(f"  {FIRE_COLORS['yellow']}0. 返回主菜单{FIRE_COLORS['reset']}")
+        print(f"{FIRE_SEPARATOR}")
+        
+        choice = input(f"{FIRE_ICONS['menu']} 请选择: ").strip()
+        
+        if choice == '0':
+            return
+        elif choice == '1':
+            self.cache.clear_cache('icp')
+        elif choice == '2':
+            self.cache.clear_cache('ip')
+        elif choice == '3':
+            self.cache.clear_cache('threat')
+        elif choice == '4':
+            confirm = input(f"{FIRE_ICONS['warning']} 确定要清除全部缓存吗？(y/n) ").strip().lower()
+            if confirm == 'y':
+                self.cache.clear_cache()
+            else:
+                print(f"{FIRE_ICONS['info']} 已取消清除操作")
+        else:
+            print(f"{FIRE_ICONS['error']} 无效选择")
+        
+        self.right_printer.等待用户按键()
+    
+    async def run(self):
+        """主程序运行入口"""
+        try:
+            self.显示_banner()
+            
+            while True:
+                choice = self.显示主菜单()
+                
+                if choice == '0':
+                    print(f"\n{FIRE_ICONS['info']} 感谢使用，再见！")
+                    self.right_printer.reset_terminal()
+                    break
+                elif choice == '1':
+                    await self.单个URL扫描流程()
+                elif choice == '2':
+                    await self.批量URL扫描流程()
+                elif choice == '3':
+                    self.查看历史记录流程()
+                elif choice == '4':
+                    self.配置管理菜单()
+                elif choice == '5':
+                    self.清除缓存流程()
+                else:
+                    print(f"{FIRE_ICONS['error']} 无效选择，请重试")
+                    self.right_printer.等待用户按键()
+        
+        except KeyboardInterrupt:
+            print(f"\n{FIRE_ICONS['info']} 用户中断操作，程序退出")
+        except Exception as e:
+            print(f"{FIRE_ICONS['error']} 程序发生错误: {str(e)}")
+        finally:
+            # 关闭所有会话
+            await self.scanner.icp_query.close()
+            await self.scanner.ip_dns_query.close()
+            await self.scanner.threat_analyzer.close()
+
+# -------------------------- 程序入口 --------------------------
+if __name__ == "__main__":
+    try:
+        # Windows异步策略修复
+        if sys.platform.startswith('win') and sys.version_info >= (3, 8):
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
+        main_app = 主程序()
+        asyncio.run(main_app.run())
+    except Exception as e:
+        print(f"{Fore.RED}程序启动失败: {str(e)}{Style.RESET_ALL}")
+        sys.exit(1)
